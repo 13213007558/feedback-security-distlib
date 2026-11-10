@@ -90,6 +90,34 @@ def enquote_executable(executable):
 _enquote_executable = enquote_executable
 
 
+def _shell_quote_for_polyglot(executable):
+    """
+    Quote an executable path for the /bin/sh fallback shebang.
+
+    The whole word is wrapped in single quotes, so spaces, ``$``, backticks,
+    backslashes and other shell metacharacters in the path are passed to the
+    shell literally instead of being word-split or evaluated. An embedded
+    single quote is escaped with the standard ``'\\''`` dance.
+
+    enquote_executable() may already have wrapped a space-containing path in
+    double quotes. Those are path characters only meaningful to a shell, so a
+    single complete pair surrounding the whole value is stripped first to
+    avoid treating the quote marks themselves as part of the file name.
+    Quoting produced for an ``/usr/bin/env ...`` form is left untouched, since
+    its double quotes only surround the trailing argument.
+
+    The resulting bytes are also valid as plain text inside the triple-single-
+    quoted string which makes up the polyglot header (no backslashes are
+    emitted other than those in the single-quote escape, which remain valid
+    Python source and don't trigger escape-sequence warnings).
+    """
+    if (executable.startswith(b'"') and executable.endswith(b'"') and
+            not executable.startswith(b'"/usr/bin/env') and
+            executable.count(b'"') == 2):
+        executable = executable[1:-1]
+    return b"'" + executable.replace(b"'", b"'\\''") + b"'"
+
+
 class ScriptMaker(object):
     """
     A class to copy or create scripts from source scripts or callable
@@ -179,8 +207,14 @@ class ScriptMaker(object):
         if simple_shebang:
             result = b'#!' + executable + post_interp + b'\n'
         else:
+            # Quote the executable so that paths containing spaces or shell
+            # metacharacters ($, backticks, quotes, ...) are passed to the
+            # shell verbatim rather than being split or evaluated. post_interp
+            # is intentionally left unquoted, as it is authored shell text
+            # (e.g. interpreter arguments) rather than part of the path.
             result = b'#!/bin/sh\n'
-            result += b"'''exec' " + executable + post_interp + b' "$0" "$@"\n'
+            result += b"'''exec' " + _shell_quote_for_polyglot(executable)
+            result += post_interp + b' "$0" "$@"\n'
             result += b"' '''\n"
         return result
 

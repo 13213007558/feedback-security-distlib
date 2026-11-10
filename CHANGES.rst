@@ -15,6 +15,14 @@ Released: Not yet.
 
     - Skip resource children that no longer exist during iteration.
 
+- scripts
+
+    - Quote the interpreter path with single quotes in the /bin/sh fallback
+      shebang so that spaces and shell metacharacters (``$``, backticks,
+      quotes) in a virtual environment path are passed literally instead of
+      being word-split or evaluated as extra commands. Interpreter arguments
+      and passed-through script arguments are unchanged.
+
 - util
 
     - Raise ``SyntaxError`` rather than ``IndexError`` for environment markers
