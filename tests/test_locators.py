@@ -23,8 +23,8 @@ from distlib import DistlibException
 from distlib.compat import url2pathname, urlparse
 from distlib.database import (Distribution, DistributionPath, make_graph, make_dist)
 from distlib.locators import (SimpleScrapingLocator, PyPIRPCLocator, PyPIJSONLocator, DirectoryLocator, DistPathLocator,
-                              AggregatingLocator, JSONLocator, DependencyFinder, locate, get_all_distribution_names,
-                              default_locator)
+                              AggregatingLocator, JSONLocator, DependencyFinder, Locator, SourceRoutingPolicy, locate,
+                              get_all_distribution_names, default_locator)
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 
@@ -591,6 +591,328 @@ class LocatorTestCase(DistlibTestCase):
             decoder = locator.decoders[encoding]
             actual = decoder(data)
             self.assertEqual(actual, payload)
+
+
+class MemoryLocator(Locator):
+    """
+    An in-memory locator for routing tests. It holds an explicit mapping of
+    normalized project name to a list of (version, requirements) tuples,
+    counts every project query, and can be told to fail a name to simulate
+    an index error.
+    """
+
+    def __init__(self, source_id, projects=None, fail_for=(), **kwargs):
+        super(MemoryLocator, self).__init__(source_id=source_id, **kwargs)
+        self.source_id = source_id
+        self.projects = projects or {}
+        self.fail_for = set(fail_for)
+        self.query_counts = {}
+
+    def _make_dist(self, name, version, requirements=()):
+        dist = make_dist(name, version, scheme=self.scheme)
+        dist.metadata.source_url = '%s/%s-%s.tar.gz' % (self.source_id, name, version)
+        if requirements:
+            dist.metadata.run_requires = [{'requires': list(requirements)}]
+        dist.locator = self
+        return dist
+
+    def _get_project(self, name):
+        from distlib.util import normalize_name
+        key = normalize_name(name)
+        self.query_counts[key] = self.query_counts.get(key, 0) + 1
+        if key in self.fail_for:
+            raise DistlibException('Simulated fetch failure for %r' % name)
+        result = {'urls': {}, 'digests': {}}
+        for project_name, version, requirements in self.projects.get(key, ()):
+            dist = self._make_dist(project_name, version, requirements)
+            result[version] = dist
+            result['urls'].setdefault(version, set()).add(dist.source_url)
+        return result
+
+    def get_distribution_names(self):
+        return set(self.projects)
+
+
+class ImpersonatingLocator(MemoryLocator):
+    """
+    A hostile locator which returns distributions stamped with another
+    locator's identity, as external metadata might self-report a trusted
+    URL. Such candidates must never be accepted as coming from the trusted
+    locator.
+    """
+
+    def __init__(self, source_id, stolen_identity, projects=None, **kwargs):
+        super(ImpersonatingLocator, self).__init__(source_id, projects, **kwargs)
+        self.stolen_identity = stolen_identity
+
+    def _make_dist(self, name, version, requirements=()):
+        dist = super(ImpersonatingLocator, self)._make_dist(name, version, requirements)
+        dist.locator = self.stolen_identity
+        return dist
+
+
+class SourceRoutingTestCase(DistlibTestCase):
+
+    def setUp(self):
+        super(SourceRoutingTestCase, self).setUp()
+        # Private index: low versions of shared names and a private-only
+        # package with a transitive dependency.
+        self.private = MemoryLocator('https://private.example/simple', projects={
+            'shared': [('shared', '1.0', ())],
+            'private-only': [('private-only', '2.0', ('shared (>=1.0)',))],
+            'acme-widget': [('acme-widget', '1.0', ())],
+            'acme-gadget': [('acme-gadget', '1.0', ())],
+            'acme': [('acme', '1.0', ())],
+            'preonly': [('preonly', '1.0a1', ())],
+        })
+        # Public index: higher versions of the same names, which must never
+        # backfill results bound to the private index.
+        self.public = MemoryLocator('https://public.example/simple', projects={
+            'shared': [('shared', '9.0', ())],
+            'private-only': [('private-only', '9.0', ())],
+            'missing-private': [('missing-private', '9.0', ())],
+            'acme-gadget': [('acme-gadget', '9.0', ())],
+            'evilpkg': [('evilpkg', '9.0', ())],
+            'free': [('free', '3.0', ())],
+        })
+        self.policy = SourceRoutingPolicy()
+        self.policy.add_exact_rule('shared', self.private)
+        self.policy.add_exact_rule('missing-private', self.private)
+        self.policy.add_exact_rule('preonly', self.private)
+        self.policy.add_prefix_rule('acme', self.private)
+        self.locator = AggregatingLocator(self.private, self.public, routing_policy=self.policy)
+
+    def test_bound_name_uses_only_bound_locator(self):
+        # The private index has shared 1.0 while the public one has 9.0.
+        dist = self.locator.locate('shared')
+        self.assertIsNotNone(dist)
+        self.assertEqual(dist.version, '1.0')
+        self.assertIs(dist.locator, self.private)
+        self.assertEqual(self.private.query_counts['shared'], 1)
+        # The public index must never have been queried for this name.
+        self.assertNotIn('shared', self.public.query_counts)
+        # Normalization differences still hit the same bound rule.
+        self.locator.clear_cache()
+        dist = self.locator.locate('SHARED')
+        self.assertEqual(dist.version, '1.0')
+        self.assertNotIn('shared', self.public.query_counts)
+
+    def test_bound_name_without_matching_version_does_not_fall_back(self):
+        # The private index has shared 1.0 only; the constraint cannot be
+        # met there, even though public shared 9.0 would satisfy it.
+        dist = self.locator.locate('shared (>=2.0)')
+        self.assertIsNone(dist)
+        self.assertEqual(self.private.query_counts['shared'], 1)
+        self.assertNotIn('shared', self.public.query_counts)
+
+    def test_bound_name_missing_in_bound_locator_does_not_fall_back(self):
+        # The bound private locator has no such project, while the public
+        # locator does. The empty private result must be reported as-is.
+        dist = self.locator.locate('missing-private')
+        self.assertIsNone(dist)
+        self.assertEqual(self.private.query_counts['missing-private'], 1)
+        self.assertNotIn('missing-private', self.public.query_counts)
+
+    def test_bound_name_fetch_failure_preserves_reason(self):
+        failing = MemoryLocator('https://failing.example/simple', projects={},
+                                fail_for=('broken',))
+        policy = SourceRoutingPolicy()
+        policy.add_exact_rule('broken', failing)
+        locator = AggregatingLocator(failing, self.public, routing_policy=policy)
+        with self.assertRaises(DistlibException) as cm:
+            locator.locate('broken')
+        self.assertIn('Simulated fetch failure', str(cm.exception))
+        self.assertNotIn('broken', self.public.query_counts)
+
+    def test_prefix_rules_match_normalized_names_with_priority(self):
+        for name in ('acme-widget', 'ACME_Widget', 'acme.gadget', 'acme'):
+            self.locator.clear_cache()
+            dist = self.locator.locate(name)
+            self.assertIsNotNone(dist, name)
+            self.assertIs(dist.locator, self.private, name)
+        self.assertNotIn('acme-widget', self.public.query_counts)
+        self.assertNotIn('acme-gadget', self.public.query_counts)
+        # Exact rules take precedence over prefix rules.
+        other = MemoryLocator('https://other.example/simple', projects={
+            'acme-widget': [('acme-widget', '5.0', ())],
+        })
+        policy = SourceRoutingPolicy()
+        policy.add_prefix_rule('acme', self.private)
+        policy.add_exact_rule('acme-widget', other)
+        locator = AggregatingLocator(self.private, other, routing_policy=policy)
+        dist = locator.locate('acme-widget')
+        self.assertEqual(dist.version, '5.0')
+        self.assertIs(dist.locator, other)
+        # A more specific prefix wins over a shorter one.
+        policy = SourceRoutingPolicy()
+        policy.add_prefix_rule('acme', self.public)
+        policy.add_prefix_rule('acme-widget', self.private)
+        locator = AggregatingLocator(self.private, self.public, routing_policy=policy)
+        dist = locator.locate('acme-widget')
+        self.assertIs(dist.locator, self.private)
+        dist = locator.locate('acme-gadget')
+        self.assertIs(dist.locator, self.public)
+
+    def test_unbound_name_keeps_aggregation_behavior(self):
+        # Nothing binds 'free', so the ordinary first-success aggregation
+        # path applies (the private locator has nothing for it).
+        dist = self.locator.locate('free')
+        self.assertIsNotNone(dist)
+        self.assertEqual(dist.version, '3.0')
+        self.assertIs(dist.locator, self.public)
+        self.assertEqual(self.public.query_counts['free'], 1)
+
+    def test_merge_mode_still_scoped_to_bound_locator(self):
+        locator = AggregatingLocator(self.private, self.public, merge=True,
+                                     routing_policy=self.policy)
+        result = locator.get_project('shared')
+        versions = [k for k in result if k not in ('urls', 'digests')]
+        self.assertEqual(versions, ['1.0'])
+        self.assertNotIn('shared', self.public.query_counts)
+        # Unbound names still merge across locators.
+        self.private.projects['free'] = [('free', '1.0', ())]
+        locator.clear_cache()
+        result = locator.get_project('free')
+        self.assertIn('1.0', result)
+        self.assertIn('3.0', result)
+
+    def test_carried_source_identity_is_verifiable(self):
+        dist = self.locator.locate('shared')
+        self.assertTrue(self.locator.is_candidate_from(dist, self.private))
+        self.assertFalse(self.locator.is_candidate_from(dist, self.public))
+        # The source_id label is caller-assigned, not taken from metadata.
+        self.assertEqual(dist.locator.source_id, 'https://private.example/simple')
+
+    def test_metadata_reported_identity_cannot_impersonate_locator(self):
+        hostile = ImpersonatingLocator('https://hostile.example/simple',
+                                       self.private,
+                                       projects={'evilpkg': [('evilpkg', '1.0', ())]})
+        # Hostile is *not* part of the locator chain but is bound to the
+        # name; its candidates claim the private locator's identity.
+        policy = SourceRoutingPolicy()
+        policy.add_exact_rule('evilpkg', hostile)
+        locator = AggregatingLocator(self.private, self.public, routing_policy=policy)
+        dist = locator.locate('evilpkg')
+        self.assertIsNone(dist)
+        self.assertTrue(locator.get_errors())
+        # A hostile locator inside the chain cannot inject a shared-name
+        # candidate either, and no fallback to public happens.
+        hostile2 = ImpersonatingLocator('https://hostile2.example/simple',
+                                        self.public,
+                                        projects={'shared': [('shared', '8.0', ())]})
+        policy2 = SourceRoutingPolicy()
+        policy2.add_exact_rule('shared', hostile2)
+        locator2 = AggregatingLocator(hostile2, self.public, routing_policy=policy2)
+        dist = locator2.locate('shared')
+        self.assertIsNone(dist)
+        self.assertNotIn('shared', self.public.query_counts)
+
+    def test_policy_change_invalidates_cache(self):
+        policy = SourceRoutingPolicy()
+        policy.add_exact_rule('shared', self.private)
+        locator = AggregatingLocator(self.private, self.public, routing_policy=policy)
+        dist = locator.locate('shared')
+        self.assertEqual(dist.version, '1.0')
+        # Rebind 'shared' to the public locator. The old private cached
+        # result must not be reused.
+        policy.add_exact_rule('shared', self.public)
+        dist = locator.locate('shared')
+        self.assertEqual(dist.version, '9.0')
+        self.assertIs(dist.locator, self.public)
+        # Removing routing entirely also invalidates, restoring
+        # aggregation for a previously bound name.
+        locator.routing_policy = None
+        locator.clear_cache()
+        self.private.query_counts.clear()
+        self.public.query_counts.clear()
+        dist = locator.locate('missing-private')
+        self.assertEqual(dist.version, '9.0')
+
+    def test_dependency_finder_direct_and_transitive_routing(self):
+        finder = DependencyFinder(self.locator)
+        dists, problems = finder.find('private-only (==2.0)')
+        self.assertFalse(problems)
+        names = dict((d.key, d) for d in dists)
+        self.assertEqual(names['private-only'].version, '2.0')
+        # The transitive 'shared' requirement resolves from the private
+        # locator, never the public 9.0.
+        self.assertEqual(names['shared'].version, '1.0')
+        self.assertIs(names['shared'].locator, self.private)
+        self.assertNotIn('shared', self.public.query_counts)
+        self.assertNotIn('private-only', self.public.query_counts)
+
+    def test_dependency_finder_prerelease_retry_stays_bound(self):
+        finder = DependencyFinder(self.locator)
+        # Only a pre-release exists, in the private locator. The
+        # prerelease retry must hit the same bound locator, not public.
+        dummy = make_dist('dummy', '0.1', scheme=self.locator.scheme)
+        dummy.metadata.run_requires = [{'requires': ['preonly']}]
+        dists, problems = finder.find(dummy)
+        self.assertFalse(problems)
+        names = dict((d.key, d) for d in dists)
+        self.assertEqual(names['preonly'].version, '1.0a1')
+        self.assertIs(names['preonly'].locator, self.private)
+        # The prerelease retry re-queries the same bound locator rather
+        # than falling back to the public one.
+        self.assertGreaterEqual(self.private.query_counts['preonly'], 1)
+        self.assertNotIn('preonly', self.public.query_counts)
+
+    def test_dependency_finder_reuses_only_same_source_provider(self):
+        finder = DependencyFinder(self.locator)
+        # First satisfy 'shared' from the private locator.
+        first = make_dist('root-a', '1.0', scheme=self.locator.scheme)
+        first.metadata.run_requires = [{'requires': ['shared']}]
+        dists, problems = finder.find(first)
+        self.assertFalse(problems)
+        provider = dict((d.key, d) for d in dists)['shared']
+        self.assertIs(provider.locator, self.private)
+        # A fresh finder with a policy binding the name to public must not
+        # reuse the old private provider for a new requirement.
+        policy = SourceRoutingPolicy()
+        policy.add_exact_rule('shared', self.public)
+        public_locator = AggregatingLocator(self.private, self.public, routing_policy=policy)
+        finder2 = DependencyFinder(public_locator)
+        finder2.provided = {'shared': set([(provider.version, provider)])}
+        reused = finder2.find_providers('shared (>=1.0)')
+        self.assertEqual(reused, set())
+        # And with no policy, an existing provider is reused as before.
+        unbound = AggregatingLocator(self.private, self.public)
+        finder3 = DependencyFinder(unbound)
+        finder3.provided = {'shared': set([(provider.version, provider)])}
+        reused = finder3.find_providers('shared (>=1.0)')
+        self.assertEqual(reused, set([provider]))
+        # A bound policy whose locator is the provider's source still
+        # allows reuse, while a different bound source rejects it.
+        bound_ok = AggregatingLocator(self.private, self.public, routing_policy=self.policy)
+        finder4 = DependencyFinder(bound_ok)
+        finder4.provided = {'shared': set([(provider.version, provider)])}
+        self.assertEqual(finder4.find_providers('shared (>=1.0)'), set([provider]))
+        policy_bad = SourceRoutingPolicy()
+        policy_bad.add_exact_rule('shared', self.public)
+        bound_bad = AggregatingLocator(self.private, self.public, routing_policy=policy_bad)
+        finder5 = DependencyFinder(bound_bad)
+        finder5.provided = {'shared': set([(provider.version, provider)])}
+        self.assertEqual(finder5.find_providers('shared (>=1.0)'), set())
+
+    def test_policy_rejects_non_locator_and_empty_prefix(self):
+        policy = SourceRoutingPolicy()
+        with self.assertRaises(DistlibException):
+            policy.add_exact_rule('foo', object())
+        with self.assertRaises(DistlibException):
+            policy.add_prefix_rule('foo', object())
+        with self.assertRaises(DistlibException):
+            policy.add_prefix_rule('', self.private)
+
+    def test_policy_direct_matching_semantics(self):
+        policy = SourceRoutingPolicy()
+        policy.add_exact_rule('Exact.Name', self.private)
+        policy.add_prefix_rule('acme', self.private)
+        self.assertIs(policy.route('exact-name'), self.private)
+        self.assertIs(policy.route('EXACT_NAME'), self.private)
+        self.assertIs(policy.route('acme-widget'), self.private)
+        # Prefix boundaries are whole name segments, not arbitrary strings.
+        self.assertIsNone(policy.route('acmewidget'))
+        self.assertIsNone(policy.route('other'))
 
 
 if __name__ == '__main__':  # pragma: no cover

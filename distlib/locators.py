@@ -99,16 +99,26 @@ class Locator(object):
 
     downloadable_extensions = source_extensions + ('.whl', )
 
-    def __init__(self, scheme='default'):
+    def __init__(self, scheme='default', source_id=None):
         """
         Initialise an instance.
         :param scheme: Because locators look for most recent versions, they
                        need to know the version scheme to use. This specifies
                        the current PEP-recommended scheme - use ``'legacy'``
                        if you need to support existing distributions on PyPI.
+        :param source_id: An optional, caller-assigned identity for this
+                          locator. It is used to verify the provenance of
+                          distributions when locators are aggregated, and is
+                          not derived from any metadata reported by an index.
+                          If not specified, a locator-specific default is
+                          used where one is available.
         """
         self._cache = {}
         self.scheme = scheme
+        if source_id is not None:
+            self.source_id = source_id
+        elif not hasattr(self, 'source_id'):
+            self.source_id = id(self)
         # Because of bugs in some of the handlers on some of the platforms,
         # we use our own opener rather than just using urlopen.
         self.opener = build_opener(RedirectHandler())
@@ -117,6 +127,33 @@ class Locator(object):
         # why this can be useful to know.
         self.matcher = None
         self.errors = queue.Queue()
+
+    def route(self, name):
+        """
+        Return the locator bound to a project name by a source-routing
+        policy, or ``None`` if the name is unbound and the usual
+        aggregation behavior applies.
+
+        The base implementation has no routing policy and so never binds a
+        name. :class:`AggregatingLocator` and other locators configured with
+        a :class:`SourceRoutingPolicy` override this.
+        """
+        return None
+
+    def is_candidate_from(self, dist, locator):
+        """
+        Say whether a candidate distribution really originates from the
+        locator which produced it.
+
+        The locator stamped on a distribution (and, when assigned, its
+        caller-provided ``source_id``) is the only trusted identity. A URL
+        or other identity self-reported in distribution metadata is not
+        consulted, so external metadata cannot impersonate another locator.
+        """
+        return dist.locator is locator or (
+            dist.locator is not None and getattr(dist.locator, 'source_id', None) is not None
+            and getattr(locator, 'source_id', None) is not None
+            and dist.locator.source_id == locator.source_id)
 
     def get_errors(self):
         """
@@ -415,6 +452,7 @@ class PyPIRPCLocator(Locator):
         """
         super(PyPIRPCLocator, self).__init__(**kwargs)
         self.base_url = url
+        self.source_id = url
         self.client = ServerProxy(url, timeout=3.0)
 
     def get_distribution_names(self):
@@ -459,6 +497,7 @@ class PyPIJSONLocator(Locator):
     def __init__(self, url, **kwargs):
         super(PyPIJSONLocator, self).__init__(**kwargs)
         self.base_url = ensure_slash(url)
+        self.source_id = self.base_url
 
     def get_distribution_names(self):
         """
@@ -622,6 +661,7 @@ class SimpleScrapingLocator(Locator):
         """
         super(SimpleScrapingLocator, self).__init__(**kwargs)
         self.base_url = ensure_slash(url)
+        self.source_id = self.base_url
         self.timeout = timeout
         self._page_cache = {}
         self._seen = set()
@@ -873,6 +913,7 @@ class DirectoryLocator(Locator):
         if not os.path.isdir(path):  # pragma: no cover
             raise DistlibException('Not a directory: %r' % path)
         self.base_dir = path
+        self.source_id = pathname2url(path)
 
     def should_include(self, filename, parent):
         """
@@ -949,6 +990,7 @@ class JSONLocator(Locator):
                     dist.digest = ('md5', info['digest'])
                 md.dependencies = info.get('requirements', {})
                 dist.exports = info.get('exports', {})
+                dist.locator = self
                 result[dist.version] = dist
                 result['urls'].setdefault(dist.version, set()).add(info['url'])
         return result
@@ -975,6 +1017,7 @@ class DistPathLocator(Locator):
         if dist is None:
             result = {'urls': {}, 'digests': {}}
         else:
+            dist.locator = self
             result = {
                 dist.version: dist,
                 'urls': {
@@ -985,6 +1028,83 @@ class DistPathLocator(Locator):
                 }
             }
         return result
+
+
+class SourceRoutingPolicy(object):
+    """
+    An explicit, caller-configured policy which binds project names to the
+    locators they must be resolved from.
+
+    Rules match against PEP 503 normalized names (see
+    :func:`distlib.util.normalize_name`), so casing and the use of ``-``,
+    ``_`` and ``.`` do not affect matching.
+
+    Exact-name rules always take precedence over prefix rules. Among prefix
+    rules, the most specific (longest) matching prefix wins; when two rules
+    register the same prefix, the first registration wins. A name that no
+    rule matches is unbound and keeps the ordinary aggregation behavior.
+
+    The policy is configured entirely by the caller. Nothing is read from
+    package metadata, so an index cannot influence routing itself.
+    """
+
+    def __init__(self):
+        self.exact = {}
+        self.prefixes = []
+        self._generation = 0
+
+    @property
+    def generation(self):
+        """
+        A monotonically increasing counter, bumped whenever the policy
+        changes. Locators use it to discard caches built under an older
+        policy rather than reuse results from a previously bound source.
+        """
+        return self._generation
+
+    def add_exact_rule(self, name, locator):
+        """
+        Bind the exact, normalized project name ``name`` to ``locator``.
+        """
+        if not isinstance(locator, Locator):
+            raise DistlibException('A locator instance is required, not %r' % locator)
+        key = normalize_name(name)
+        self.exact[key] = locator
+        self._generation += 1
+        return key
+
+    def add_prefix_rule(self, prefix, locator):
+        """
+        Bind every project whose normalized name is ``prefix`` or begins
+        with ``prefix`` followed by ``-`` to ``locator``.
+        """
+        if not isinstance(locator, Locator):
+            raise DistlibException('A locator instance is required, not %r' % locator)
+        key = normalize_name(prefix)
+        if not key:
+            raise DistlibException('A non-empty prefix is required')
+        for existing, loc in self.prefixes:
+            if existing == key:
+                # First registration of a prefix wins, so priorities stay
+                # explicit rather than depending on dict ordering.
+                return key
+        self.prefixes.append((key, locator))
+        self.prefixes.sort(key=lambda item: len(item[0]), reverse=True)
+        self._generation += 1
+        return key
+
+    def route(self, name):
+        """
+        Return the locator bound to the normalized form of ``name``, or
+        ``None`` if the name is unbound.
+        """
+        key = normalize_name(name)
+        if key in self.exact:
+            return self.exact[key]
+        for prefix, locator in self.prefixes:
+            if key == prefix or key.startswith(prefix + '-'):
+                return locator
+        return None
 
 
 class AggregatingLocator(Locator):
@@ -1003,10 +1123,65 @@ class AggregatingLocator(Locator):
                          search from any of the locators is returned. If True,
                          the results from all locators are merged (this can be
                          slow).
+                       * routing_policy - an optional
+                         :class:`SourceRoutingPolicy` binding specific project
+                         names to particular locators. A bound name is only
+                         ever sought from its bound locator; if that locator
+                         has no matching version, returns nothing or fails,
+                         the original outcome is reported and no other
+                         locator is consulted.
         """
         self.merge = kwargs.pop('merge', False)
+        self.routing_policy = kwargs.pop('routing_policy', None)
         self.locators = locators
         super(AggregatingLocator, self).__init__(**kwargs)
+        self._cached_routing_generation = self._routing_generation()
+
+    def _routing_generation(self):
+        policy = self.routing_policy
+        if policy is None:
+            return None
+        return policy.generation
+
+    def route(self, name):
+        policy = self.routing_policy
+        if policy is None:
+            result = None
+        else:
+            result = policy.route(name)
+        return result
+
+    def _drop_untrusted(self, d, locator):
+        """
+        Remove distributions from a locator's result that do not carry that
+        locator's provenance, returning a new result dictionary. Trust is
+        based on the stamped locator identity (and caller-assigned
+        ``source_id``); metadata-reported URLs are never trusted for this.
+        """
+        versions = [k for k in d if k not in ('urls', 'digests')]
+        bad = [k for k in versions if not self.is_candidate_from(d[k], locator)]
+        if not bad:
+            return d
+        logger.warning('Ignoring %d candidate(s) from %r without its locator identity',
+                       len(bad), getattr(locator, 'source_id', locator))
+        self.errors.put('Candidate(s) %r did not originate from locator %r' % (bad, locator))
+        result = {'urls': dict(d.get('urls', {})), 'digests': dict(d.get('digests', {}))}
+        for k in versions:
+            if k not in bad:
+                result[k] = d[k]
+            else:
+                result['urls'].pop(k, None)
+        return result
+
+    def get_project(self, name):
+        # A changed routing policy invalidates anything cached under the
+        # old policy, so a name can never resolve through a formerly bound
+        # (or formerly unbound) source.
+        generation = self._routing_generation()
+        if generation != self._cached_routing_generation:
+            self._cache.clear()
+            self._cached_routing_generation = generation
+        return super(AggregatingLocator, self).get_project(name)
 
     def clear_cache(self):
         super(AggregatingLocator, self).clear_cache()
@@ -1021,9 +1196,20 @@ class AggregatingLocator(Locator):
     scheme = property(Locator.scheme.fget, _set_scheme)
 
     def _get_project(self, name):
+        bound = self.route(name)
+        if bound is not None:
+            # Bound names never fall through to other locators. An empty
+            # result stays empty and an exception propagates unchanged, so
+            # the original reason for failure is always preserved.
+            d = bound.get_project(name)
+            if d:
+                d = self._drop_untrusted(d, bound)
+            return d
         result = {}
         for locator in self.locators:
             d = locator.get_project(name)
+            if d:
+                d = self._drop_untrusted(d, locator)
             if d:
                 if self.merge:
                     files = result.get('urls', {})
@@ -1056,6 +1242,8 @@ class AggregatingLocator(Locator):
                     else:
                         found = False
                         for k in d:
+                            if k in ('urls', 'digests'):
+                                continue
                             if self.matcher.match(k):
                                 found = True
                                 break
@@ -1161,6 +1349,11 @@ class DependencyFinder(object):
         name = matcher.key  # case-insensitive
         result = set()
         provided = self.provided
+        # The name may be bound to a specific locator. A provider chosen
+        # earlier (e.g. via an unbound aggregation path or another
+        # requirement) must only be reused when it genuinely comes from the
+        # bound source; otherwise it is located afresh through the locator.
+        bound = self.locator.route(matcher.name)
         if name in provided:
             for version, provider in provided[name]:
                 try:
@@ -1168,7 +1361,7 @@ class DependencyFinder(object):
                 except UnsupportedVersionError:
                     match = False
 
-                if match:
+                if match and (bound is None or self.locator.is_candidate_from(provider, bound)):
                     result.add(provider)
                     break
         return result

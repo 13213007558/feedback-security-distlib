@@ -9,7 +9,7 @@ _ver = sys.version_info[:2]
 
 from test_database import (DataFilesTestCase, TestDatabase, TestDistribution, TestEggInfoDistribution, DepGraphTestCase)
 from test_index import PackageIndexTestCase
-from test_locators import LocatorTestCase
+from test_locators import LocatorTestCase, SourceRoutingTestCase
 from test_manifest import ManifestTestCase, ManifestSymlinkTestCase
 from test_markers import MarkersTestCase
 from test_metadata import MetadataTestCase, LegacyMetadataTestCase

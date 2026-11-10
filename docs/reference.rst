@@ -755,12 +755,32 @@ Classes
 
       A :class:~distlib.version.VersionMatcher`
 
-   .. method:: __init__(scheme='default')
+   .. method:: __init__(scheme='default', source_id=None)
 
       Initialise an instance of the locator.
 
       :param scheme: The version scheme to use.
       :type scheme: str
+      :param source_id: An optional caller-assigned identity for the locator,
+                        used to verify the provenance of candidates. It is not
+                        derived from index metadata. If omitted, a
+                        locator-specific default is used where available.
+      :type source_id: str
+
+   .. attribute:: source_id
+
+      The verifiable identity of the locator, assigned by the caller rather
+      than reported by external metadata.
+
+   .. method:: route(name)
+
+      Return the locator bound to a project name by a source-routing policy,
+      or ``None`` when the name is unbound and ordinary aggregation applies.
+
+   .. method:: is_candidate_from(dist, locator)
+
+      Return whether a candidate distribution genuinely originates from the
+      given locator, based on its stamped locator identity and ``source_id``.
 
    .. method:: _get_project(name)
 
@@ -919,6 +939,30 @@ Classes
       :type distpath: :class:`~distlib.database.DistributionPath`
       :param  kwargs: Passed to base class constructor.
 
+.. class:: SourceRoutingPolicy
+
+   An explicit, caller-configured policy which binds project names to the
+   locators they must be resolved from. Rules match against PEP 503
+   normalized names, so casing and the use of ``-``, ``_`` and ``.`` in
+   names do not affect matching. Exact-name rules take precedence over
+   prefix rules; among prefix rules the most specific matching prefix wins,
+   and the first registration of a duplicated prefix wins. The policy is
+   not influenced by package metadata.
+
+   .. method:: add_exact_rule(name, locator)
+
+      Bind the exact, normalized project name ``name`` to ``locator``.
+
+   .. method:: add_prefix_rule(prefix, locator)
+
+      Bind every project whose normalized name is ``prefix`` or begins with
+      ``prefix`` followed by ``-`` to ``locator``.
+
+   .. method:: route(name)
+
+      Return the locator bound to the normalized form of ``name``, or
+      ``None`` if the name is unbound.
+
 .. class:: AggregatingLocator(Locator)
 
    This locator uses a list of other aggregators and delegates finding projects
@@ -940,6 +984,17 @@ Classes
                     passed in.
 
       :type merge: bool
+
+      :param routing_policy: If this *kwarg* is a :class:`SourceRoutingPolicy`,
+                    a name bound by the policy is only ever sought from its
+                    bound locator, in both merge and non-merge modes. If that
+                    locator has no matching version, returns nothing or raises,
+                    the original outcome is reported and no other locator is
+                    consulted. Unbound names keep the aggregation behavior
+                    described above. Changing the policy invalidates cached
+                    results.
+
+      :type routing_policy: SourceRoutingPolicy
 
 .. class:: DependencyFinder
 

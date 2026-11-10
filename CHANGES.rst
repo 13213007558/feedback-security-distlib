@@ -30,6 +30,20 @@ Released: Not yet.
     - Parse versions with many trailing-zero release segments in linear rather
       than quadratic time, so a crafted version string cannot stall the parser.
 
+- locators
+
+    - Add ``SourceRoutingPolicy`` and an optional ``routing_policy`` argument
+      to ``AggregatingLocator`` for binding normalized project names (exact or
+      prefix) to specific locators. Bound names are resolved only from their
+      bound locator; missing versions, empty results and fetch failures are
+      reported as-is rather than falling through to other locators, while
+      unbound names keep the existing aggregation and merge behavior.
+
+    - Add a caller-assigned ``source_id`` to locators and verify candidate
+      provenance via the stamped locator identity, so metadata-reported URLs
+      cannot impersonate a trusted locator. Cached results are invalidated
+      when the routing policy changes.
+
 
 0.4.4
 ~~~~~
