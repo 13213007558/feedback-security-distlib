@@ -8,13 +8,21 @@ from __future__ import unicode_literals
 import base64
 import io
 import os
+import errno
 import hashlib
 import logging
 import random
 import re
 import shutil
+import stat
 import sys
 import tempfile
+import threading
+
+try:
+    from unittest import mock
+except ImportError:  # pragma: no cover
+    import mock
 
 from compat import unittest
 
@@ -22,7 +30,8 @@ from distlib import DistlibException
 from distlib.compat import text_type, StringIO
 from distlib.metadata import Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME
 from distlib.database import (InstalledDistribution, EggInfoDistribution, BaseInstalledDistribution, EXPORTS_FILENAME,
-                              DistributionPath, make_graph, get_required_dists, get_dependent_dists)
+                              DistributionPath, make_graph, get_required_dists, get_dependent_dists, FileAuditResult,
+                              AUDIT_MATCHED, AUDIT_TAMPERED, AUDIT_OUTSIDE_ROOTS, AUDIT_UNVERIFIED)
 from distlib.util import get_resources_dests, CSVReader, read_exports
 
 from test_util import GlobTestCaseBase
@@ -1020,6 +1029,403 @@ class DepGraphTestCase(LoggingCatcher, DistlibTestCase):
         self.assertTrue(repr(graph))
 
 
+class RestrictedAuditTestCase(DistlibTestCase):
+    """Tests for the restricted, root-bounded audit of RECORD entries."""
+
+    def setUp(self):
+        super(RestrictedAuditTestCase, self).setUp()
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir)
+
+        # A fake environment: an install root containing a package and a
+        # separate, sibling script directory.
+        self.prefix = os.path.join(self.tmpdir, 'env')
+        self.install_root = os.path.join(self.prefix, 'lib', 'site-packages')
+        self.script_dir = os.path.join(self.prefix, 'bin')
+        self.outside_dir = os.path.join(self.tmpdir, 'elsewhere')
+        for d in (self.install_root, self.script_dir, self.outside_dir):
+            os.makedirs(d)
+
+        self.pkg_dir = os.path.join(self.install_root, 'auditedpkg')
+        os.makedirs(self.pkg_dir)
+        self.module_path = os.path.join(self.pkg_dir, '__init__.py')
+        with open(self.module_path, 'w') as f:
+            f.write('# audited package\n')
+        self.extra_path = os.path.join(self.install_root, 'data.txt')
+        with open(self.extra_path, 'w') as f:
+            f.write('payload\n')
+
+        self.dist_info = os.path.join(self.install_root, 'auditedpkg-1.0.dist-info')
+        os.makedirs(self.dist_info)
+        with open(os.path.join(self.dist_info, METADATA_FILENAME), 'w') as f:
+            f.write('Metadata-Version: 1.2\nName: auditedpkg\nVersion: 1.0\n')
+        self.record_path = os.path.join(self.dist_info, 'RECORD')
+        self.dist = InstalledDistribution(self.dist_info)
+        self.base = self.install_root
+
+        self.script_path = os.path.join(self.script_dir, 'audited-tool')
+        with open(self.script_path, 'w') as f:
+            f.write('#!/bin/sh\necho ok\n')
+        os.chmod(self.script_path, 0o755)
+
+        self.outside_path = os.path.join(self.outside_dir, 'secret.txt')
+        with open(self.outside_path, 'w') as f:
+            f.write('not part of any authorised root\n')
+
+    # -- helpers ---------------------------------------------------------
+
+    def _hash(self, data, algorithm='sha256'):
+        digest = hashlib.new(algorithm, data).digest()
+        return '%s=%s' % (algorithm, base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii'))
+
+    def _record_row(self, absolute_path):
+        with open(absolute_path, 'rb') as f:
+            data = f.read()
+        return self._rel(absolute_path), self._hash(data), str(len(data))
+
+    def _rel(self, absolute_path):
+        return os.path.relpath(absolute_path, self.base).replace(os.sep, '/')
+
+    def _write_record(self, rows):
+        with open(self.record_path, 'w') as f:
+            for row in rows:
+                f.write(','.join(row) + '\n')
+            f.write('%s,,\n' % self._rel(self.record_path))
+
+    def _valid_rows(self):
+        return [self._record_row(self.module_path), self._record_row(self.extra_path),
+                self._record_row(self.script_path)]
+
+    def _audit(self, rows=None, **kwargs):
+        if rows is None:
+            rows = self._valid_rows()
+        self._write_record(rows)
+        options = dict(install_roots=[self.install_root], script_dirs=[self.script_dir])
+        options.update(kwargs)
+        return self.dist.audit_installed_files(**options)
+
+    def _result_for(self, results, path):
+        matches = [r for r in results if r.path == path]
+        self.assertEqual(len(matches), 1, 'expected one result for %r, got %r' % (path, results))
+        result = matches[0]
+        self.assertIsInstance(result, FileAuditResult)
+        return result
+
+    # -- happy path ------------------------------------------------------
+
+    def test_matching_entries_including_relative_script(self):
+        results = self._audit()
+        # the script entry uses '..' to reach the sibling bin directory
+        script_entry = self._rel(self.script_path)
+        self.assertIn('..', script_entry.split('/'))
+        statuses = {r.path: r.status for r in results}
+        self.assertEqual(set(statuses.values()), {AUDIT_MATCHED})
+        self.assertEqual(len(results), 3)
+        for result in results:
+            self.assertEqual(result.detail, 'ok')
+            self.assertNotEqual(result.actual, None)
+
+    def test_script_directory_must_be_authorised(self):
+        # Without the script directory, the '..' reference escapes the root.
+        results = self._audit(script_dirs=[])
+        result = self._result_for(results, self.script_path)
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        # nothing outside an authorised root may have been read
+        self.assertEqual(result.actual, os.path.realpath(self.script_path))
+
+    def test_roots_are_required(self):
+        self.assertRaises(ValueError, self.dist.audit_installed_files, install_roots=[])
+        self.assertRaises(ValueError, self.dist.audit_installed_files, install_roots=[], script_dirs=[])
+
+    def test_bad_policy_and_chunk_size(self):
+        self.assertRaises(ValueError, self.dist.audit_installed_files,
+                          install_roots=[self.install_root], weak_hash_policy='nope')
+        self.assertRaises(ValueError, self.dist.audit_installed_files,
+                          install_roots=[self.install_root], chunk_size=0)
+
+    # -- outside-roots rejection ----------------------------------------
+
+    def test_absolute_outside_entry_rejected_before_read(self):
+        row = (self.outside_path,) + self._record_row(self.outside_path)[1:]
+        results = self._audit(rows=self._valid_rows() + [row])
+        result = self._result_for(results, self.outside_path)
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        self.assertEqual(result.detail, 'absolute-path')
+
+    def test_relative_traversal_escape_rejected(self):
+        outside_rel = os.path.relpath(self.outside_path, self.base).replace(os.sep, '/')
+        self.assertTrue(outside_rel.startswith('../'))
+        row = (outside_rel,) + self._record_row(self.outside_path)[1:]
+        results = self._audit(rows=self._valid_rows() + [row])
+        result = self._result_for(results, os.path.abspath(os.path.join(self.base, outside_rel)))
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        self.assertEqual(result.detail, 'outside-roots')
+
+    def test_escaping_symlink_rejected_before_read(self):
+        link_path = os.path.join(self.pkg_dir, 'sneaky-link')
+        os.symlink(self.outside_path, link_path)
+        row = (self._rel(link_path), '', '')
+        results = self._audit(rows=self._valid_rows() + [row])
+        result = self._result_for(results, link_path)
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        self.assertEqual(result.detail, 'symlink-target')
+        self.assertEqual(result.actual, os.path.realpath(self.outside_path))
+
+    def test_symlink_inside_roots_is_audited(self):
+        target = os.path.join(self.pkg_dir, 'real.txt')
+        with open(target, 'wb') as f:
+            f.write(b'link target contents')
+        link_path = os.path.join(self.pkg_dir, 'safe-link')
+        os.symlink(target, link_path)
+        results = self._audit(rows=self._valid_rows() + [self._record_row(link_path)])
+        result = self._result_for(results, link_path)
+        self.assertEqual(result.status, AUDIT_MATCHED)
+
+    def test_dangling_symlink_inside_roots_is_tampered(self):
+        link_path = os.path.join(self.pkg_dir, 'dangling')
+        inside_missing = os.path.join(self.install_root, 'gone')
+        os.symlink(inside_missing, link_path)
+        results = self._audit(rows=self._valid_rows() + [(self._rel(link_path), '', '')])
+        result = self._result_for(results, link_path)
+        self.assertEqual(result.status, AUDIT_TAMPERED)
+        self.assertEqual(result.detail, 'exists')
+
+    def test_dangling_symlink_outside_roots_is_rejected(self):
+        link_path = os.path.join(self.pkg_dir, 'dangling-out')
+        os.symlink(os.path.join(self.outside_dir, 'missing'), link_path)
+        results = self._audit(rows=self._valid_rows() + [(self._rel(link_path), '', '')])
+        result = self._result_for(results, link_path)
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        self.assertEqual(result.detail, 'symlink-target')
+
+    # -- non-regular files ----------------------------------------------
+
+    def test_fifo_is_not_read(self):
+        fifo = os.path.join(self.pkg_dir, 'pipe')
+        os.mkfifo(fifo)
+        results = self._audit(rows=self._valid_rows() + [(self._rel(fifo), '', '')])
+        result = self._result_for(results, fifo)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'not-regular')
+        # the FIFO must still be present, proving it was never opened
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+
+    def test_fifo_read_does_not_block(self):
+        fifo = os.path.join(self.pkg_dir, 'pipe')
+        os.mkfifo(fifo)
+        self._write_record([(self._rel(fifo), '', '')])
+
+        def run():
+            self.dist.audit_installed_files(install_roots=[self.install_root])
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), 'audit blocked while opening a FIFO')
+
+    def test_directory_member_is_unverified(self):
+        directory = os.path.join(self.pkg_dir, 'subpkg')
+        os.makedirs(directory)
+        results = self._audit(rows=self._valid_rows() + [(self._rel(directory), '', '')])
+        result = self._result_for(results, directory)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'directory')
+
+    def test_device_link_is_not_read_as_package_file(self):
+        device = os.path.join(self.pkg_dir, 'device-link')
+        os.symlink('/dev/null', device)
+        results = self._audit(rows=self._valid_rows() + [(self._rel(device), '', '')])
+        result = self._result_for(results, device)
+        self.assertEqual(result.status, AUDIT_OUTSIDE_ROOTS)
+        self.assertEqual(result.detail, 'symlink-target')
+
+    @unittest.skipIf(not (hasattr(os, 'geteuid') and os.geteuid() == 0), 'mknod requires root')
+    def test_device_node_inside_roots_is_unverified(self):
+        device = os.path.join(self.pkg_dir, 'null-device')
+        os.mknod(device, stat.S_IFCHR | 0o644, os.makedev(3, 0))
+        results = self._audit(rows=self._valid_rows() + [(self._rel(device), '', '')])
+        result = self._result_for(results, device)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'not-regular')
+
+    # -- missing / tampered files ---------------------------------------
+
+    def test_missing_file_is_tampered(self):
+        missing = os.path.join(self.pkg_dir, 'removed.py')
+        row = ('auditedpkg/removed.py', self._hash(b'data'), '4')
+        results = self._audit(rows=self._valid_rows() + [row])
+        result = self._result_for(results, missing)
+        self.assertEqual(result.status, AUDIT_TAMPERED)
+        self.assertEqual(result.detail, 'exists')
+        self.assertEqual(result.expected, True)
+        self.assertEqual(result.actual, False)
+
+    def test_size_mismatch_is_tampered(self):
+        rows = self._valid_rows()
+        good_hash = self._record_row(self.extra_path)[1]
+        idx = [r[0] for r in rows].index(self._rel(self.extra_path))
+        rows[idx] = (rows[idx][0], good_hash, '999')
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_TAMPERED)
+        self.assertEqual(result.detail, 'size')
+        self.assertEqual(result.expected, 999)
+
+    def test_hash_mismatch_is_tampered(self):
+        rows = self._valid_rows()
+        idx = [r[0] for r in rows].index(self._rel(self.module_path))
+        rows[idx] = (rows[idx][0], self._hash(b'different content'), rows[idx][2])
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.module_path)
+        self.assertEqual(result.status, AUDIT_TAMPERED)
+        self.assertEqual(result.detail, 'hash')
+
+    def test_same_size_change_still_detected(self):
+        original = b'audited payload here'
+        replacement = b'AUDITED PAYLOAD HERE'
+        self.assertEqual(len(replacement), len(original))
+        with open(self.module_path, 'wb') as f:
+            f.write(replacement)
+        rows = self._valid_rows()
+        idx = [r[0] for r in rows].index(self._rel(self.module_path))
+        rows[idx] = (rows[idx][0], self._hash(original), str(len(original)))
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.module_path)
+        self.assertEqual(result.status, AUDIT_TAMPERED)
+        self.assertEqual(result.detail, 'hash')
+
+    # -- digest policies -------------------------------------------------
+
+    def test_empty_digest_is_never_matched(self):
+        rows = self._valid_rows()
+        idx = [r[0] for r in rows].index(self._rel(self.extra_path))
+        rows[idx] = (rows[idx][0], '', rows[idx][2])
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'no-digest')
+        self.assertEqual(result.actual, os.path.getsize(self.extra_path))
+
+    def test_weak_algorithm_reported_then_allowed(self):
+        with open(self.extra_path, 'rb') as f:
+            data = f.read()
+        weak_row = (self._rel(self.extra_path), self._hash(data, 'md5'), str(len(data)))
+        rows = [r for r in self._valid_rows() if r[0] != self._rel(self.extra_path)] + [weak_row]
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'weak-algorithm')
+        self.assertEqual(result.expected, 'md5')
+
+        results = self._audit(rows=rows, weak_hash_policy='allow')
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_MATCHED)
+
+    def test_unknown_algorithm_is_unverified_even_when_weak_allowed(self):
+        weird_row = (self._rel(self.extra_path), 'rot13=abcdef', '8')
+        rows = [r for r in self._valid_rows() if r[0] != self._rel(self.extra_path)] + [weird_row]
+        results = self._audit(rows=rows, weak_hash_policy='allow')
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'unknown-algorithm')
+
+    def test_malformed_hash_is_unverified(self):
+        weird_row = (self._rel(self.extra_path), 'noequalsign', '8')
+        rows = [r for r in self._valid_rows() if r[0] != self._rel(self.extra_path)] + [weird_row]
+        results = self._audit(rows=rows)
+        result = self._result_for(results, self.extra_path)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'malformed-hash')
+
+    # -- read-time failures ---------------------------------------------
+
+    def test_file_changed_during_read_is_unverified(self):
+        # A large file, rewritten with a different size after the audit's
+        # initial fstat but before reading completes. The post-read fstat
+        # detects the mid-audit change, so the computed hash can never be
+        # trusted. The entry deliberately records no size, so the result has
+        # to come from the read-time change detection rather than a size
+        # comparison.
+        target = os.path.join(self.pkg_dir, 'large.bin')
+        original = b'a' * (65536 * 2 + 17)
+        with open(target, 'wb') as f:
+            f.write(original)
+        target_ino = os.stat(target).st_ino
+        target_row = (self._rel(target), self._hash(original), '')
+        real_fstat = os.fstat
+        mutated = {'done': False}
+
+        def fstat(fd):
+            result = real_fstat(fd)
+            if not mutated['done'] and result.st_ino == target_ino:
+                mutated['done'] = True
+                before = result
+                with open(target, 'wb') as f:
+                    f.write(b'b' * 10)
+                # Keep returning the pre-mutation stat for this descriptor,
+                # mimicking the real timing where pre_stat is captured first.
+                return before
+            return result
+
+        with mock.patch('distlib.database.os.fstat', side_effect=fstat):
+            results = self._audit(rows=self._valid_rows() + [target_row])
+        result = self._result_for(results, target)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'changed-during-read')
+
+    def test_file_vanished_during_read_is_unverified(self):
+        target = self.module_path
+        target_ino = os.stat(target).st_ino
+        real_fdopen = os.fdopen
+
+        def fdopen(fd, mode='r', *args, **kwargs):
+            wrapped = real_fdopen(fd, mode, *args, **kwargs)
+            if os.fstat(fd).st_ino == target_ino:
+                os.unlink(target)
+            return wrapped
+
+        with mock.patch('distlib.database.os.fdopen', side_effect=fdopen):
+            results = self._audit()
+        result = self._result_for(results, target)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'vanished')
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root bypasses permission checks')
+    def test_permission_error_is_unverified(self):
+        target = self.extra_path
+        rows = self._valid_rows()
+        real_open = os.open
+        opening = {'done': False}
+
+        def opener(path, flags, *args):
+            if not opening['done'] and path == target:
+                opening['done'] = True
+                raise OSError(errno.EACCES, 'permission denied')
+            return real_open(path, flags, *args)
+
+        with mock.patch('distlib.database.os.open', side_effect=opener):
+            results = self._audit(rows=rows)
+        result = self._result_for(results, target)
+        self.assertEqual(result.status, AUDIT_UNVERIFIED)
+        self.assertEqual(result.detail, 'permission')
+
+    # -- compatibility ---------------------------------------------------
+
+    def test_legacy_interface_return_shape_unchanged(self):
+        # The lightweight interface keeps returning plain mismatch tuples
+        # and reports an empty list for a healthy tree.
+        self._write_record(self._valid_rows())
+        mismatches = self.dist.check_installed_files()
+        self.assertEqual(mismatches, [])
+        with open(self.module_path, 'wb') as f:
+            f.write(b'tampered')
+        mismatches = self.dist.check_installed_files()
+        self.assertEqual(len(mismatches), 1)
+        self.assertEqual(len(mismatches[0]), 4)
+        self.assertEqual(mismatches[0][1], 'size')
+
+
 def test_suite():
     suite = unittest.TestSuite()
     load = unittest.defaultTestLoader.loadTestsFromTestCase
@@ -1028,6 +1434,7 @@ def test_suite():
     suite.addTest(load(TestDatabase))
     suite.addTest(load(DataFilesTestCase))
     suite.addTest(load(DepGraphTestCase))
+    suite.addTest(load(RestrictedAuditTestCase))
     return suite
 
 

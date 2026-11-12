@@ -9,10 +9,12 @@ from __future__ import unicode_literals
 
 import base64
 import contextlib
+import errno
 import hashlib
 import logging
 import os
 import posixpath
+import stat
 import sys
 import zipimport
 
@@ -24,10 +26,53 @@ from .util import (parse_requirement, cached_property, parse_name_and_version, r
                    CSVWriter)
 
 __all__ = [
-    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath'
+    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath',
+    'FileAuditResult', 'AUDIT_MATCHED', 'AUDIT_TAMPERED', 'AUDIT_OUTSIDE_ROOTS', 'AUDIT_UNVERIFIED',
 ]
 
 logger = logging.getLogger(__name__)
+
+# Audit statuses returned by InstalledDistribution.audit_installed_files.
+AUDIT_MATCHED = 'matched'
+AUDIT_TAMPERED = 'tampered'
+AUDIT_OUTSIDE_ROOTS = 'outside-roots'
+AUDIT_UNVERIFIED = 'unverified'
+
+# Hash algorithms which are considered too weak to verify integrity against
+# unless the caller explicitly opts in via weak_hash_policy='allow'.
+_WEAK_HASHERS = frozenset(('md5', 'sha1'))
+
+# Default chunk size used when reading files for hashing during a restricted
+# audit, so that package files are never read wholly into memory.
+AUDIT_CHUNK_SIZE = 65536
+
+try:
+    from collections import namedtuple
+except ImportError:  # pragma: no cover
+    namedtuple = None
+
+if namedtuple is not None:
+    FileAuditResult = namedtuple('FileAuditResult', 'path status detail expected actual')
+    FileAuditResult.__doc__ = (
+        'The result of auditing a single RECORD entry. ``path`` is the '
+        'absolute path the entry resolves to, ``status`` is one of the '
+        '``AUDIT_*`` constants, ``detail`` gives a machine-readable reason, '
+        'and ``expected``/``actual`` carry the recorded and observed values '
+        '(size or hash) when applicable, else ``None``.')
+else:  # pragma: no cover
+    class FileAuditResult(tuple):
+        """Fallback tuple used if collections.namedtuple is unavailable."""
+
+        __slots__ = ()
+
+        def __new__(cls, path, status, detail, expected=None, actual=None):
+            return tuple.__new__(cls, (path, status, detail, expected, actual))
+
+        path = property(lambda self: self[0])
+        status = property(lambda self: self[1])
+        detail = property(lambda self: self[2])
+        expected = property(lambda self: self[3])
+        actual = property(lambda self: self[4])
 
 EXPORTS_FILENAME = 'pydist-exports.json'
 COMMANDS_FILENAME = 'pydist-commands.json'
@@ -729,6 +774,250 @@ class InstalledDistribution(BaseInstalledDistribution):
                         if actual_hash != hash_value:
                             mismatches.append((path, 'hash', hash_value, actual_hash))
         return mismatches
+
+    def audit_installed_files(self, install_roots, script_dirs=(), weak_hash_policy='report',
+                              chunk_size=AUDIT_CHUNK_SIZE):
+        """
+        Restricted, security-oriented audit of the files listed in ``RECORD``.
+
+        Unlike :meth:`check_installed_files`, every entry is resolved against
+        an explicit set of authorised locations before anything is read. The
+        caller must pass the installation root(s) (typically the ``purelib`` /
+        ``platlib`` directories) and, where applicable, the script
+        directory/directories. Relative ``RECORD`` entries which legitimately
+        refer to a script via ``..`` are accepted as long as they resolve
+        inside one of these roots; entries which resolve anywhere else are
+        rejected *before* being opened. Absolute entries, symbolic links,
+        directories and non-regular files (devices, pipes, sockets) are each
+        handled separately and never followed blindly.
+
+        :param install_roots: Iterable of absolute paths the caller authorises
+                              as installation roots. At least one is required.
+        :param script_dirs:   Optional iterable of authorised script
+                              directory paths.
+        :param weak_hash_policy: ``'report'`` (the default) marks entries
+                              recorded with a weak or unknown digest algorithm
+                              as :data:`AUDIT_UNVERIFIED`; ``'allow'`` verifies
+                              weak algorithms (currently ``md5`` and
+                              ``sha1``) normally. Unknown algorithms are always
+                              unverified.
+        :param chunk_size:    Read buffer size in bytes, so that audited files
+                              are streamed rather than read whole.
+        :return: A list of :class:`FileAuditResult` instances, one per audited
+                 ``RECORD`` entry (the ``RECORD`` entry itself is skipped).
+                 Each result is one of :data:`AUDIT_MATCHED`,
+                 :data:`AUDIT_TAMPERED`, :data:`AUDIT_OUTSIDE_ROOTS` or
+                 :data:`AUDIT_UNVERIFIED`; the last three must never be
+                 treated as a successful integrity check.
+        """
+        if weak_hash_policy not in ('report', 'allow'):
+            raise ValueError("weak_hash_policy must be 'report' or 'allow', got %r" % weak_hash_policy)
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer, got %r' % chunk_size)
+        roots = []
+        for root in tuple(install_roots) + tuple(script_dirs):
+            root = os.path.realpath(os.path.abspath(root))
+            if root not in roots:
+                roots.append(root)
+        if not roots:
+            raise ValueError('at least one authorised install root or script directory is required')
+
+        base = os.path.dirname(self.path)
+        record_path = os.path.realpath(self.get_distinfo_file('RECORD'))
+        results = []
+        for entry, hash_value, size in self.list_installed_files():
+            if not entry:
+                continue
+            if os.path.isabs(entry):
+                candidate = os.path.abspath(entry)
+                outside_detail = 'absolute-path'
+            else:
+                # PEP 376 stores '/'-separated relative paths; '..' is legal
+                # here because scripts may live next to, rather than under,
+                # the installation root.
+                relative = entry.replace('/', os.sep)
+                candidate = os.path.abspath(os.path.join(base, relative))
+                outside_detail = 'outside-roots'
+            result = self._audit_record_entry(candidate, record_path, roots, outside_detail,
+                                               hash_value, size, weak_hash_policy, chunk_size)
+            if result is not None:
+                results.append(result)
+        return results
+
+    def _audit_record_entry(self, candidate, record_path, roots, outside_detail,
+                            hash_value, size, weak_hash_policy, chunk_size):
+        # Inspect the path itself first, without following links, so that
+        # symlinks and special files are classified before any open().
+        try:
+            link_stat = os.lstat(candidate)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                # A recorded file which is simply absent is tampering with the
+                # installed layout, distinct from an audit we cannot finish.
+                return FileAuditResult(candidate, AUDIT_TAMPERED, 'exists', True, False)
+            return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'stat-error', None, None)
+
+        if stat.S_ISLNK(link_stat.st_mode):
+            # Resolve the real target and authorise it before reading. A
+            # dangling link falls through to the existence check below.
+            target = os.path.realpath(candidate)
+            if not self._path_within_roots(roots, target):
+                return FileAuditResult(candidate, AUDIT_OUTSIDE_ROOTS, 'symlink-target', None, target)
+            try:
+                target_stat = os.stat(candidate)
+            except OSError as e:
+                if e.errno == errno.ENOENT:
+                    return FileAuditResult(candidate, AUDIT_TAMPERED, 'exists', True, False)
+                return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'stat-error', None, None)
+            mode = target_stat.st_mode
+        else:
+            target = os.path.realpath(candidate)
+            if not self._path_within_roots(roots, target):
+                return FileAuditResult(candidate, AUDIT_OUTSIDE_ROOTS, outside_detail, None, target)
+            mode = link_stat.st_mode
+
+        if target == record_path:
+            # The RECORD file carries no hash of itself; nothing to verify.
+            return None
+
+        if stat.S_ISDIR(mode):
+            # Directories carry no integrity claim in RECORD; do not try to
+            # read one as if it were a package file.
+            return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'directory', None, None)
+        if not stat.S_ISREG(mode):
+            # Devices, pipes, sockets and anything else unusual are never
+            # opened, so a hostile RECORD cannot make the audit block on a
+            # FIFO or read arbitrary device data.
+            return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'not-regular', None, None)
+
+        expected_size = None
+        if size:
+            try:
+                expected_size = int(size)
+            except (TypeError, ValueError):
+                return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'malformed-size', size, None)
+
+        algorithm = None
+        if hash_value:
+            if '=' not in hash_value:
+                return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'malformed-hash', hash_value, None)
+            algorithm = hash_value.split('=', 1)[0].lower()
+            guaranteed = getattr(hashlib, 'algorithms_guaranteed', None)
+            if guaranteed is None:  # pragma: no cover
+                guaranteed = hashlib.algorithms
+            if algorithm not in guaranteed:
+                return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'unknown-algorithm', algorithm, None)
+            if algorithm in _WEAK_HASHERS and weak_hash_policy == 'report':
+                return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'weak-algorithm', algorithm, None)
+
+        outcome = self._read_regular_file(candidate, algorithm, chunk_size, expected_size)
+        if outcome[0] == 'size-mismatch':
+            # The file already had an unexpected size when it was opened:
+            # this is ordinary tampering, not an audit that could not run.
+            _, _, actual_size = outcome
+            return FileAuditResult(candidate, AUDIT_TAMPERED, 'size', expected_size, actual_size)
+        if outcome[0] != 'ok':
+            _, detail, actual = outcome
+            return FileAuditResult(candidate, AUDIT_UNVERIFIED, detail, None, actual)
+        _, _, actual_size, actual_hash = outcome
+
+        if expected_size is not None and actual_size != expected_size:
+            return FileAuditResult(candidate, AUDIT_TAMPERED, 'size', expected_size, actual_size)
+        if not hash_value:
+            # An empty digest can never establish integrity, even when the
+            # size happens to match.
+            return FileAuditResult(candidate, AUDIT_UNVERIFIED, 'no-digest', None, actual_size)
+        if actual_hash != hash_value:
+            return FileAuditResult(candidate, AUDIT_TAMPERED, 'hash', hash_value, actual_hash)
+        return FileAuditResult(candidate, AUDIT_MATCHED, 'ok', hash_value, actual_hash)
+
+    def _read_regular_file(self, path, algorithm, chunk_size, expected_size=None):
+        """
+        Stream a regular file in chunks, returning
+        ``('ok', 'ok', size, hash_value)`` on success or a
+        ``(status, detail, value)`` tuple describing what happened. Files
+        which change, disappear or become unreadable while being read are
+        reported as unverifiable rather than matched; a size which was
+        already wrong when the file was opened is reported as
+        ``'size-mismatch'`` (ordinary tampering).
+        """
+        flags = os.O_RDONLY
+        if hasattr(os, 'O_NONBLOCK'):
+            # Defence in depth: never block even if a non-regular file slipped
+            # past the earlier stat checks in a race.
+            flags |= os.O_NONBLOCK
+        try:
+            fd = os.open(path, flags)
+        except OSError as e:
+            if e.errno in (errno.EACCES, getattr(errno, 'EPERM', -1)):
+                return ('error', 'permission', None)
+            if e.errno == errno.ENOENT:
+                return ('error', 'vanished', None)
+            return ('error', 'open-error', None)
+        try:
+            f = os.fdopen(fd, 'rb')
+        except Exception:  # pragma: no cover
+            os.close(fd)
+            raise
+        hasher = hashlib.new(algorithm) if algorithm else None
+        read_size = 0
+        try:
+            with f:
+                pre_stat = os.fstat(f.fileno())
+                if not stat.S_ISREG(pre_stat.st_mode):
+                    return ('error', 'not-regular', None)
+                # If the recorded size already disagrees with the file we just
+                # opened, that is tampering with a stable file, not an audit
+                # interrupted by a concurrent modification.
+                if expected_size is not None and pre_stat.st_size != expected_size:
+                    return ('size-mismatch', 'size', pre_stat.st_size)
+                while True:
+                    try:
+                        chunk = f.read(chunk_size)
+                    except OSError as e:
+                        if e.errno in (errno.EACCES, getattr(errno, 'EPERM', -1)):
+                            return ('error', 'permission', None)
+                        return ('error', 'read-error', None)
+                    if not chunk:
+                        break
+                    read_size += len(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
+                post_stat = os.fstat(f.fileno())
+        except OSError as e:
+            if e.errno in (errno.EACCES, getattr(errno, 'EPERM', -1)):
+                return ('error', 'permission', None)
+            return ('error', 'read-error', None)
+
+        if (post_stat.st_size != pre_stat.st_size or post_stat.st_mtime != pre_stat.st_mtime
+                or read_size != pre_stat.st_size):
+            # The file was replaced, appended to or truncated while we were
+            # reading it: whatever hash we computed is not trustworthy.
+            return ('error', 'changed-during-read', post_stat.st_size)
+        # Re-check the path itself: a same-size replacement via rename would
+        # keep the open descriptor valid while removing the audited path.
+        try:
+            os.lstat(path)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                return ('error', 'vanished', None)
+            return ('error', 'stat-error', None)
+
+        if hasher is None:
+            actual_hash = None
+        else:
+            digest = base64.urlsafe_b64encode(hasher.digest()).rstrip(b'=').decode('ascii')
+            actual_hash = '%s=%s' % (algorithm, digest)
+        return ('ok', 'ok', read_size, actual_hash)
+
+    @staticmethod
+    def _path_within_roots(roots, candidate):
+        candidate = os.path.abspath(candidate)
+        for root in roots:
+            root_with_sep = root.rstrip(os.sep) + os.sep
+            if candidate == root or candidate.startswith(root_with_sep):
+                return True
+        return False
 
     @cached_property
     def shared_locations(self):
